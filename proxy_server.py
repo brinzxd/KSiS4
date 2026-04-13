@@ -15,15 +15,13 @@ from urllib.parse import urlparse
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 
-CONFIG_FILE = "proxy_config.json"
+CONFIG_FILE    = "proxy_config.json"
+BLACKLIST_FILE = "blacklist.txt"
+
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8080,
-    "buffer_size": 4096,
-    "blacklist": [
-        "example-blocked.com",
-        "ads.example.com"
-    ]
+    "buffer_size": 4096
 }
 
 # ─── ANSI colors ───────────────────────────────────────────────────────────────
@@ -52,6 +50,46 @@ def load_config():
             json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
         print(f"{CYAN}[CONFIG]{RESET} Created default config: {CONFIG_FILE}")
     return DEFAULT_CONFIG.copy()
+
+# ─── Blacklist loader ──────────────────────────────────────────────────────────
+
+def load_blacklist() -> list[str]:
+    """
+    Read blacklist from BLACKLIST_FILE (one entry per line).
+    Lines starting with # are treated as comments and ignored.
+    Empty lines are ignored.
+    Returns a list of lowercase domain/URL strings.
+    """
+    if not os.path.exists(BLACKLIST_FILE):
+        # Create a sample blacklist file if it doesn't exist
+        sample = (
+            "# HTTP Proxy — Blacklist\n"
+            "# One entry per line: domain or full URL prefix\n"
+            "# Lines starting with # are comments\n"
+            "#\n"
+            "# Examples:\n"
+            "#   example-blocked.com        — blocks domain and all subdomains\n"
+            "#   ads.example.com            — blocks only this subdomain\n"
+            "#   http://example.com/ads/    — blocks specific URL prefix\n"
+            "#\n"
+            "example-blocked.com\n"
+            "ads.example.com\n"
+        )
+        with open(BLACKLIST_FILE, "w", encoding="utf-8") as f:
+            f.write(sample)
+        print(f"{CYAN}[BLACKLIST]{RESET} Created sample blacklist: {BLACKLIST_FILE}")
+        return ["example-blocked.com", "ads.example.com"]
+
+    entries = []
+    with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.append(line.lower())
+
+    print(f"{GREEN}[BLACKLIST]{RESET} Loaded {len(entries)} entries from {BLACKLIST_FILE}")
+    return entries
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 
@@ -85,17 +123,21 @@ def log(method, url, status_code, blocked=False, extra=""):
 
 # ─── Blacklist check ───────────────────────────────────────────────────────────
 
-def is_blacklisted(host, url, blacklist):
+def is_blacklisted(host: str, url: str, blacklist: list[str]) -> bool:
     host_lower = host.lower()
     url_lower  = url.lower()
     for entry in blacklist:
-        entry = entry.lower().strip()
+        entry = entry.strip()
         if not entry:
             continue
-        if host_lower == entry or host_lower.endswith("." + entry):
-            return True
-        if url_lower.startswith("http://" + entry) or url_lower.startswith("https://" + entry):
-            return True
+        # Entry is a full URL prefix (starts with http://)
+        if entry.startswith("http://") or entry.startswith("https://"):
+            if url_lower.startswith(entry):
+                return True
+        else:
+            # Entry is a domain — match exact or subdomain
+            if host_lower == entry or host_lower.endswith("." + entry):
+                return True
     return False
 
 # ─── HTTP parsing ───────────────────────────────────────────────────────────────
@@ -155,7 +197,7 @@ def rewrite_request(data: bytes, host: str, port: int, path: str, version: str, 
         new_lines = [lines[0]]
         for line in lines[1:]:
             if line.lower().startswith(b"proxy-connection:"):
-                continue  # remove proxy-only header
+                continue
             new_lines.append(line)
 
         return b"\r\n".join(new_lines) + b"\r\n\r\n" + body
@@ -198,9 +240,8 @@ def blocked_response(url: str) -> bytes:
 
 # ─── Client handler ─────────────────────────────────────────────────────────────
 
-def handle_client(client_sock: socket.socket, addr, config: dict):
-    blacklist = config.get("blacklist", [])
-    buf_size  = config.get("buffer_size", 4096)
+def handle_client(client_sock: socket.socket, addr, config: dict, blacklist: list[str]):
+    buf_size   = config.get("buffer_size", 4096)
     server_sock = None
 
     try:
@@ -244,9 +285,9 @@ def handle_client(client_sock: socket.socket, addr, config: dict):
         server_sock.sendall(rewritten)
 
         # Stream response back
-        status_code  = None
-        first_chunk  = True
-        total_bytes  = 0
+        status_code = None
+        first_chunk = True
+        total_bytes = 0
 
         while True:
             try:
@@ -293,9 +334,11 @@ def handle_client(client_sock: socket.socket, addr, config: dict):
 # ─── Main ──────────────────────────────────────────────────────────────────────
 
 def run_proxy():
-    config = load_config()
-    host   = config.get("host", "127.0.0.1")
-    port   = config.get("port", 8080)
+    config    = load_config()
+    blacklist = load_blacklist()
+
+    host = config.get("host", "127.0.0.1")
+    port = config.get("port", 8080)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -306,11 +349,11 @@ def run_proxy():
     print(f"{BOLD}{CYAN}╔══════════════════════════════════════════════╗{RESET}")
     print(f"{BOLD}{CYAN}║       HTTP Proxy Server  v1.0  (Python)      ║{RESET}")
     print(f"{BOLD}{CYAN}╚══════════════════════════════════════════════╝{RESET}")
-    print(f"  {GREEN}●{RESET} Listening  {BOLD}{host}:{port}{RESET}")
-    print(f"  {YELLOW}●{RESET} Blacklist  {len(config.get('blacklist', []))} entries")
-    print(f"  {CYAN}●{RESET} Config     {CONFIG_FILE}")
+    print(f"  {GREEN}●{RESET} Listening   {BOLD}{host}:{port}{RESET}")
+    print(f"  {YELLOW}●{RESET} Blacklist   {len(blacklist)} entries  ({BLACKLIST_FILE})")
+    print(f"  {CYAN}●{RESET} Config      {CONFIG_FILE}")
     print()
-    print(f"  Set browser HTTP proxy to:  {BOLD}{host}  {port}{RESET}")
+    print(f"  Set browser HTTP proxy to:  {BOLD}{host}  port {port}{RESET}")
     print()
     print(f"{GRAY}  {'Time':^10}  {'#':^6}  {'Method':<8}  {'Status':<8}  URL{RESET}")
     print(f"{GRAY}  {'─'*10}  {'─'*6}  {'─'*8}  {'─'*8}  {'─'*50}{RESET}")
@@ -320,7 +363,7 @@ def run_proxy():
             client_sock, addr = srv.accept()
             t = threading.Thread(
                 target=handle_client,
-                args=(client_sock, addr, config),
+                args=(client_sock, addr, config, blacklist),
                 daemon=True
             )
             t.start()
